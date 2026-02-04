@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>EMG Web Monitor</title>
+
+  <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      background: #f4f4f4;
+      margin: 0;
+      padding: 20px;
+    }
+    .container {
+      max-width: 980px;
+      margin: auto;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.08);
+    }
+    h1 { margin: 10px 0 5px; }
+    button {
+      padding: 10px 18px;
+      font-size: 16px;
+      cursor: pointer;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      margin: 8px 6px;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    #status { margin: 10px; color: #444; }
+
+    .charts {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+    #chart1, #chart2 { width: 100%; height: 340px; }
+    .hint {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #666;
+      line-height: 1.35;
+      text-align: left;
+    }
+    .row {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .pill {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #f1f3f5;
+      color: #444;
+      font-size: 13px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1>Monitoreo EMG - UPS</h1>
+
+    <div class="row">
+      <button id="connectBtn">Conectar Bluetooth</button>
+      <button id="disconnectBtn" disabled>Desconectar</button>
+      <span class="pill" id="ratePill">0.0 Hz</span>
+    </div>
+
+    <p id="status">Estado: Desconectado</p>
+
+    <div class="charts">
+      <div id="chart1"></div>
+      <div id="chart2"></div>
+    </div>
+
+    <div class="hint">
+      <b>Notas:</b>
+      <ul>
+        <li>Usa <b>Chrome</b> o <b>Edge</b> (Web Bluetooth).</li>
+        <li>Si lo abres como <code>file://</code> y falla, súbelo a un servidor local simple.</li>
+        <li>Este ejemplo grafica la señal <b>HP (High-Pass)</b> de cada canal. Si quieres envolvente también, te lo agrego.</li>
+      </ul>
+    </div>
+  </div>
+
+  <script>
+    // === UUIDs (deben coincidir con el ESP32) ===
+    const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+    const CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+    const DEVICE_NAME  = "EMG_UPS_WEB";
+
+    // === Config de gráficos ===
+    const MAX_POINTS = 300;
+
+    // === Referencias BLE ===
+    let deviceRef = null;
+    let characteristic = null;
+
+    // === Tiempo ===
+    let t0 = 0;
+    let lastT = null;
+
+    // === Medición tasa de llegada (Hz) ===
+    let lastRateT = 0;
+    let notifCount = 0;
+
+    // === Filtros (estado por canal) ===
+    // High-pass 1er orden + envolvente (envolvente no se grafica aquí, pero queda lista)
+    let prevX1 = 0, prevY1 = 0, prevEnv1 = 0;
+    let prevX2 = 0, prevY2 = 0, prevEnv2 = 0;
+
+    const FC_HP  = 5.0;  // Hz (corte HP)
+    const FC_ENV = 2.0;  // Hz (corte envolvente)
+    const RC_HP  = 1 / (2 * Math.PI * FC_HP);
+    const RC_ENV = 1 / (2 * Math.PI * FC_ENV);
+
+    // === UI ===
+    const connectBtn = document.getElementById("connectBtn");
+    const disconnectBtn = document.getElementById("disconnectBtn");
+    const statusEl = document.getElementById("status");
+    const ratePill = document.getElementById("ratePill");
+
+    function setStatus(text) {
+      statusEl.innerText = text;
+    }
+
+    function initPlots() {
+      const layout1 = {
+        title: "EMG1 (High-Pass ~5 Hz)",
+        margin: { t: 45, l: 55, r: 20, b: 45 },
+        xaxis: { title: "Tiempo (s)" },
+        yaxis: { title: "mV (HP)" }
+      };
+
+      const layout2 = {
+        title: "EMG2 (High-Pass ~5 Hz)",
+        margin: { t: 45, l: 55, r: 20, b: 45 },
+        xaxis: { title: "Tiempo (s)" },
+        yaxis: { title: "mV (HP)" }
+      };
+
+      Plotly.newPlot("chart1", [{
+        x: [], y: [],
+        mode: "lines",
+        name: "EMG1 HP"
+      }], layout1, { responsive: true });
+
+      Plotly.newPlot("chart2", [{
+        x: [], y: [],
+        mode: "lines",
+        name: "EMG2 HP"
+      }], layout2, { responsive: true });
+    }
+
+    function resetFilters() {
+      prevX1 = 0; prevY1 = 0; prevEnv1 = 0;
+      prevX2 = 0; prevY2 = 0; prevEnv2 = 0;
+    }
+
+    function resetTiming() {
+      t0 = performance.now();
+      lastT = null;
+
+      lastRateT = performance.now();
+      notifCount = 0;
+      ratePill.innerText = "0.0 Hz";
+    }
+
+    function updateRate() {
+      const now = performance.now();
+      const elapsed = (now - lastRateT) / 1000;
+      if (elapsed >= 1.0) {
+        const hz = notifCount / elapsed;
+        ratePill.innerText = `${hz.toFixed(1)} Hz`;
+        notifCount = 0;
+        lastRateT = now;
+      }
+    }
+
+    async function connect() {
+      try {
+        initPlots();         // <-- CLAVE: crear plots antes de extendTraces
+        resetFilters();
+        resetTiming();
+
+        setStatus("Estado: Buscando dispositivo...");
+        connectBtn.disabled = true;
+
+        deviceRef = await navigator.bluetooth.requestDevice({
+          filters: [{ name: DEVICE_NAME }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        deviceRef.addEventListener("gattserverdisconnected", onDisconnected);
+
+        setStatus("Estado: Conectando...");
+        const server  = await deviceRef.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        characteristic = await service.getCharacteristic(CHAR_UUID);
+
+        await characteristic.startNotifications();
+        characteristic.addEventListener("characteristicvaluechanged", handleData);
+
+        setStatus("Estado: Conectado");
+        disconnectBtn.disabled = false;
+
+      } catch (error) {
+        console.log(error);
+        alert("Error de conexión: " + error);
+        setStatus("Estado: Desconectado");
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+      }
+    }
+
+    async function disconnect() {
+      try {
+        if (characteristic) {
+          characteristic.removeEventListener("characteristicvaluechanged", handleData);
+        }
+        if (deviceRef && deviceRef.gatt.connected) {
+          deviceRef.gatt.disconnect();
+        }
+      } catch (e) {
+        console.log(e);
+      } finally {
+        onDisconnected();
+      }
+    }
+
+    function onDisconnected() {
+      setStatus("Estado: Desconectado");
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      characteristic = null;
+    }
+
+    function handleData(event) {
+      notifCount++;
+      updateRate();
+
+      // Decodificar string
+      let value = new TextDecoder().decode(event.target.value);
+      value = value.replace(/\0/g, "").trim(); // limpiar nulos
+
+      const parts = value.split(",");
+      if (parts.length < 2) return;
+
+      const adc1 = Number(parts[0]);
+      const adc2 = Number(parts[1]);
+      if (!Number.isFinite(adc1) || !Number.isFinite(adc2)) return;
+
+      // Tiempo y dt real
+      const t = (performance.now() - t0) / 1000;
+
+      let dt = 0.05; // fallback
+      if (lastT !== null) dt = Math.max(0.001, t - lastT);
+      lastT = t;
+
+      // ADC -> mV (aprox)
+      const raw1 = (adc1 / 4095) * 3300;
+      const raw2 = (adc2 / 4095) * 3300;
+
+      // High-pass 1er orden
+      const hp1 = (RC_HP / (RC_HP + dt)) * (prevY1 + raw1 - prevX1);
+      const hp2 = (RC_HP / (RC_HP + dt)) * (prevY2 + raw2 - prevX2);
+
+      // Envolvente (lista por si luego la quieres graficar también)
+      const env1 = prevEnv1 + (dt / (RC_ENV + dt)) * (Math.abs(hp1) - prevEnv1);
+      const env2 = prevEnv2 + (dt / (RC_ENV + dt)) * (Math.abs(hp2) - prevEnv2);
+
+      // Guardar estados
+      prevX1 = raw1; prevY1 = hp1; prevEnv1 = env1;
+      prevX2 = raw2; prevY2 = hp2; prevEnv2 = env2;
+
+      // Actualizar gráficos (ventana deslizante)
+      Plotly.extendTraces("chart1", { x: [[t]], y: [[hp1]] }, [0], MAX_POINTS);
+      Plotly.extendTraces("chart2", { x: [[t]], y: [[hp2]] }, [0], MAX_POINTS);
+    }
+
+    connectBtn.addEventListener("click", connect);
+    disconnectBtn.addEventListener("click", disconnect);
+  </script>
+</body>
+</html>
